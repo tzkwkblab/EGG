@@ -34,7 +34,12 @@ from .language_analysis import (
     PrintValidationEvents,
     TopographicSimilarity,
 )
-from .losses import DiscriminationLoss, NTXentLoss, ReconstructionLoss
+from .losses import (
+    AttributeReconstructionLoss,
+    DiscriminationLoss,
+    NTXentLoss,
+    ReconstructionLoss,
+)
 from .population import FullSweepAgentSampler, PopulationGame, UniformAgentSampler
 from .reinforce_wrappers import (
     CommunicationRnnReinforce,
@@ -51,6 +56,7 @@ from .reinforce_wrappers import (
 from .rnn import RnnEncoder
 from .trainers import Trainer
 from .util import (
+    build_game_optimizer,
     build_optimizer,
     close,
     find_lengths,
@@ -65,6 +71,8 @@ __all__ = [
     "get_opts",
     "init",
     "build_optimizer",
+    "build_game_optimizer",
+    "AttributeReconstructionLoss",
     "Callback",
     "EarlyStopperAccuracy",
     "ConsoleLogger",

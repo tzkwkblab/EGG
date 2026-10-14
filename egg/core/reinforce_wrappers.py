@@ -5,7 +5,7 @@
 
 import math
 from collections import defaultdict
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -465,6 +465,10 @@ class SenderReceiverRnnReinforce(nn.Module):
         baseline_type: Baseline = MeanBaseline,
         train_logging_strategy: LoggingStrategy = None,
         test_logging_strategy: LoggingStrategy = None,
+        sender_loss: Optional[Callable] = None,
+        value_fn: Optional[nn.Module] = None,
+        value_loss_coeff: float = 1.0,
+        log_reinforce_stats: bool = False,
     ):
         """
         :param sender: sender agent
@@ -485,11 +489,21 @@ class SenderReceiverRnnReinforce(nn.Module):
         :param baseline_type: Callable, returns a baseline instance (eg a class specializing core.baselines.Baseline)
         :param train_logging_strategy, test_logging_strategy: specify what parts of interactions to persist for
             later analysis in callbacks
+        :param sender_loss: optional loss with the same signature as `loss`. If set, its (detached) value is used
+            as the negative reward in Sender's policy gradient, while Receiver is still trained with `loss`
+            (default: Sender is rewarded with `loss`)
+        :param value_fn: optional module mapping (sender_input, aux_input) to a per-example prediction of the
+            Sender's loss. If set, it replaces `baseline_type` as the baseline and is trained by regression
+            (e.g. core.baselines.MLPCritic)
+        :param value_loss_coeff: coefficient of the value function's squared error
+        :param log_reinforce_stats: if True, adds `reward_loss`, `baseline` and `log_prob_s` to the aux info
         """
         super(SenderReceiverRnnReinforce, self).__init__()
         self.sender = sender
         self.receiver = receiver
         self.loss = loss
+        self.sender_loss = sender_loss
+        self.value_fn = value_fn
 
         self.mechanics = CommunicationRnnReinforce(
             sender_entropy_coeff,
@@ -498,6 +512,8 @@ class SenderReceiverRnnReinforce(nn.Module):
             baseline_type,
             train_logging_strategy,
             test_logging_strategy,
+            value_loss_coeff=value_loss_coeff,
+            log_reinforce_stats=log_reinforce_stats,
         )
 
     def forward(self, sender_input, labels, receiver_input=None, aux_input=None):
@@ -509,6 +525,8 @@ class SenderReceiverRnnReinforce(nn.Module):
             labels,
             receiver_input,
             aux_input,
+            sender_loss=self.sender_loss,
+            value_fn=self.value_fn,
         )
 
 
@@ -521,6 +539,8 @@ class CommunicationRnnReinforce(nn.Module):
         baseline_type: Baseline = MeanBaseline,
         train_logging_strategy: LoggingStrategy = None,
         test_logging_strategy: LoggingStrategy = None,
+        value_loss_coeff: float = 1.0,
+        log_reinforce_stats: bool = False,
     ):
         """
         :param sender_entropy_coeff: entropy regularization coeff for sender
@@ -529,6 +549,9 @@ class CommunicationRnnReinforce(nn.Module):
         :param baseline_type: Callable, returns a baseline instance (eg a class specializing core.baselines.Baseline)
         :param train_logging_strategy, test_logging_strategy: specify what parts of interactions to persist for
             later analysis in callbacks
+        :param value_loss_coeff: coefficient of the squared error of the value function (used if `value_fn`
+            is passed to `forward`)
+        :param log_reinforce_stats: if True, adds `reward_loss`, `baseline` and `log_prob_s` to the aux info
 
         """
         super().__init__()
@@ -536,6 +559,8 @@ class CommunicationRnnReinforce(nn.Module):
         self.sender_entropy_coeff = sender_entropy_coeff
         self.receiver_entropy_coeff = receiver_entropy_coeff
         self.length_cost = length_cost
+        self.value_loss_coeff = value_loss_coeff
+        self.log_reinforce_stats = log_reinforce_stats
 
         self.baselines = defaultdict(baseline_type)
         self.train_logging_strategy = (
@@ -558,6 +583,8 @@ class CommunicationRnnReinforce(nn.Module):
         labels,
         receiver_input=None,
         aux_input=None,
+        sender_loss=None,
+        value_fn=None,
     ):
         message, log_prob_s, entropy_s = sender(sender_input, aux_input)
         message_length = find_lengths(message)
@@ -565,9 +592,24 @@ class CommunicationRnnReinforce(nn.Module):
             message, receiver_input, aux_input, message_length
         )
 
-        loss, aux_info = loss(
+        loss_fn = loss
+        loss, aux_info = loss_fn(
             sender_input, message, receiver_input, receiver_output, labels, aux_input
         )
+
+        # the (detached) loss that defines Sender's reward; by default the optimized loss itself
+        if sender_loss is None:
+            reward_loss = loss.detach()
+        else:
+            reward_loss, _ = sender_loss(
+                sender_input,
+                message,
+                receiver_input,
+                receiver_output.detach(),
+                labels,
+                aux_input,
+            )
+            reward_loss = reward_loss.detach()
 
         # the entropy of the outputs of S before and including the eos symbol - as we don't care about what's after
         effective_entropy_s = torch.zeros_like(entropy_r)
@@ -595,17 +637,31 @@ class CommunicationRnnReinforce(nn.Module):
             (length_loss - self.baselines["length"].predict(length_loss))
             * effective_log_prob_s
         ).mean()
-        policy_loss = (
-            (loss.detach() - self.baselines["loss"].predict(loss.detach())) * log_prob
-        ).mean()
+        if value_fn is None:
+            value = None
+            baseline = self.baselines["loss"].predict(reward_loss)
+        else:
+            value = value_fn(sender_input, aux_input)
+            baseline = value.detach()
+        policy_loss = ((reward_loss - baseline) * log_prob).mean()
 
         optimized_loss = policy_length_loss + policy_loss - weighted_entropy
         # if the receiver is deterministic/differentiable, we apply the actual loss
         optimized_loss += loss.mean()
+        if value is not None:
+            optimized_loss += (
+                self.value_loss_coeff * (value - reward_loss).pow(2).mean()
+            )
 
         if self.training:
-            self.baselines["loss"].update(loss)
+            if value_fn is None:
+                self.baselines["loss"].update(reward_loss)
             self.baselines["length"].update(length_loss)
+
+        if self.log_reinforce_stats:
+            aux_info["reward_loss"] = reward_loss
+            aux_info["baseline"] = baseline.expand_as(reward_loss).detach()
+            aux_info["log_prob_s"] = effective_log_prob_s.detach()
 
         aux_info["sender_entropy"] = entropy_s.detach()
         aux_info["receiver_entropy"] = entropy_r.detach()

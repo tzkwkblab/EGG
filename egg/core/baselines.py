@@ -87,3 +87,50 @@ class BuiltInBaseline(Baseline):
         baseline = (mean * bsz - loss_detached) / (bsz - 1.0)
 
         return baseline
+
+
+class MLPCritic(torch.nn.Module):
+    """State-value function (critic) that does not share parameters with Sender.
+
+    Predicts the per-example loss from Sender's input; use it as `value_fn` of
+    `SenderReceiverRnnReinforce` to get an actor-critic style baseline.
+
+    >>> critic = MLPCritic(n_inputs=6, n_hidden=4)
+    >>> critic(torch.zeros(3, 6)).shape
+    torch.Size([3])
+    """
+
+    def __init__(self, n_inputs: int, n_hidden: int, n_layers: int = 1):
+        super().__init__()
+        layers, d = [], n_inputs
+        for _ in range(n_layers):
+            layers += [torch.nn.Linear(d, n_hidden), torch.nn.ReLU()]
+            d = n_hidden
+        layers.append(torch.nn.Linear(d, 1))
+        self.net = torch.nn.Sequential(*layers)
+
+    def forward(self, sender_input, aux_input=None):
+        return self.net(sender_input).squeeze(-1)
+
+
+class SharedFeatureCritic(torch.nn.Module):
+    """State-value function (critic) computed from the features of Sender's input encoder.
+
+    `encoder` is the very module Sender uses to encode its input (called as `encoder(x, aux_input)`),
+    so its parameters are shared. With `detach_input=True` the critic's loss does not propagate
+    into the encoder.
+    """
+
+    def __init__(
+        self, encoder: torch.nn.Module, n_hidden: int, detach_input: bool = False
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.head = torch.nn.Linear(n_hidden, 1)
+        self.detach_input = detach_input
+
+    def forward(self, sender_input, aux_input=None):
+        features = self.encoder(sender_input, aux_input)
+        if self.detach_input:
+            features = features.detach()
+        return self.head(features).squeeze(-1)
