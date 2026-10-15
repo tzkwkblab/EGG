@@ -185,6 +185,7 @@ def init(
         "adam": torch.optim.Adam,
         "sgd": torch.optim.SGD,
         "adagrad": torch.optim.Adagrad,
+        "adamw": torch.optim.AdamW,
     }
     if common_opts.optimizer in optimizers:
         optimizer = optimizers[common_opts.optimizer]
@@ -226,6 +227,42 @@ def get_opts() -> argparse.Namespace:
 
 def build_optimizer(params: Iterable) -> torch.optim.Optimizer:
     return optimizer(params, lr=get_opts().lr)
+
+
+def build_game_optimizer(
+    game: torch.nn.Module,
+    lr: Optional[float] = None,
+    sender_lr: Optional[float] = None,
+    receiver_lr: Optional[float] = None,
+    weight_decay: Optional[float] = None,
+) -> torch.optim.Optimizer:
+    """Builds the optimizer chosen by --optimizer with separate parameter groups for Receiver
+    (`game.receiver`) and for everything else in the game (Sender, value function, ...), so that
+    the two can have different learning rates. `lr` defaults to --lr; the learning rates of the
+    groups default to `lr` (or to the game's own --sender_lr / --receiver_lr options, if it
+    defines them); `weight_decay` defaults to the optimizer's own default.
+    """
+    opts = get_opts()
+    lr = opts.lr if lr is None else lr
+    if sender_lr is None:
+        sender_lr = getattr(opts, "sender_lr", None)
+    if receiver_lr is None:
+        receiver_lr = getattr(opts, "receiver_lr", None)
+    if weight_decay is None:
+        weight_decay = getattr(opts, "weight_decay", None)
+    sender_lr = lr if sender_lr is None else sender_lr
+    receiver_lr = lr if receiver_lr is None else receiver_lr
+
+    receiver_params = list(game.receiver.parameters())
+    receiver_ids = {id(p) for p in receiver_params}
+    other_params = [p for p in game.parameters() if id(p) not in receiver_ids]
+
+    groups = [
+        {"params": other_params, "lr": sender_lr, "name": "sender"},
+        {"params": receiver_params, "lr": receiver_lr, "name": "receiver"},
+    ]
+    kwargs = {} if weight_decay is None else {"weight_decay": weight_decay}
+    return optimizer(groups, lr=lr, **kwargs)
 
 
 def get_summary_writer() -> "torch.utils.SummaryWriter":

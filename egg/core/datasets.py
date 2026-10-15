@@ -200,3 +200,85 @@ class AttributesValuesWithDistractorsIterator(AttributesValuesIterator):
         labels = torch.from_numpy(labels).long()
         receiver_input = torch.from_numpy(receiver_input).float()
         return target, labels, receiver_input
+
+
+class CyclicBatchSampler:
+    """Yields batches of example indices, `steps_per_epoch` batches per epoch.
+
+    Indices cycle through the dataset; the position is kept across epochs, so that every example
+    is visited equally often independently of where epochs end. With `shuffle=True` the order is
+    re-drawn (with `generator`) at the beginning of every pass through the data; a batch that
+    straddles two passes takes the tail of one and the head of the next.
+
+    >>> s = CyclicBatchSampler(n_examples=5, batch_size=2, steps_per_epoch=3)
+    >>> [b.tolist() for b in s]
+    [[0, 1], [2, 3], [4, 0]]
+    >>> [b.tolist() for b in s]
+    [[1, 2], [3, 4], [0, 1]]
+    """
+
+    def __init__(
+        self,
+        n_examples: int,
+        batch_size: int,
+        steps_per_epoch: int,
+        shuffle: bool = False,
+        generator: torch.Generator = None,
+    ):
+        self.n_examples = n_examples
+        self.batch_size = batch_size
+        self.steps_per_epoch = steps_per_epoch
+        self.shuffle = shuffle
+        self.generator = generator
+        self._buffer = torch.empty(0, dtype=torch.long)
+
+    def _next_pass(self) -> torch.Tensor:
+        if self.shuffle:
+            return torch.randperm(self.n_examples, generator=self.generator)
+        return torch.arange(self.n_examples)
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+    def __iter__(self):
+        for _ in range(self.steps_per_epoch):
+            while self._buffer.numel() < self.batch_size:
+                self._buffer = torch.cat([self._buffer, self._next_pass()])
+            batch, self._buffer = (
+                self._buffer[: self.batch_size],
+                self._buffer[self.batch_size :],
+            )
+            yield batch
+
+
+class IndexedTensorLoader:
+    """Minimal data loader over tensors that are already in memory (possibly on GPU).
+
+    Iterating yields `(sender_input, labels)` batches selected by `batch_sampler`; indexing whole
+    tensors avoids the per-example overhead of torch.utils.data.DataLoader for small examples.
+    `batch_transform(sender_input, labels) -> sender_input`, if given, is applied to every batch
+    (e.g. to add per-presentation noise to Sender's input).
+
+    >>> x, y = torch.arange(10).view(5, 2), torch.arange(5)
+    >>> loader = IndexedTensorLoader(x, y, CyclicBatchSampler(5, 2, 2))
+    >>> [(a.shape, b.tolist()) for a, b in loader]
+    [(torch.Size([2, 2]), [0, 1]), (torch.Size([2, 2]), [2, 3])]
+    """
+
+    def __init__(self, sender_inputs, labels, batch_sampler, batch_transform=None):
+        assert len(sender_inputs) == len(labels)
+        self.sender_inputs = sender_inputs
+        self.labels = labels
+        self.batch_sampler = batch_sampler
+        self.batch_transform = batch_transform
+
+    def __len__(self):
+        return len(self.batch_sampler)
+
+    def __iter__(self):
+        for idx in self.batch_sampler:
+            idx = idx.to(self.sender_inputs.device)
+            x, y = self.sender_inputs[idx], self.labels[idx]
+            if self.batch_transform is not None:
+                x = self.batch_transform(x, y)
+            yield x, y

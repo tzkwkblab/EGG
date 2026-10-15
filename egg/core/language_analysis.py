@@ -5,7 +5,7 @@
 
 import json
 from collections import defaultdict
-from typing import Callable, Union
+from typing import Callable, Optional, Sequence, Union
 
 import editdistance
 import numpy as np
@@ -350,3 +350,119 @@ class PrintValidationEvents(Callback):
     # same behaviour if we reached early stopping
     def on_early_stopping(self, _train_loss, _train_logs, epoch, _test_loss, test_logs):
         self.print_events(test_logs)
+
+
+# ---------------------------------------------------------------------------
+# Functional, vectorized versions of the metrics above. They take integer arrays
+# (attributes [N, n], messages [N, L]) so that they can be called at any time,
+# not only from the epoch-level callbacks.
+# ---------------------------------------------------------------------------
+
+
+def _to_numpy(x) -> np.ndarray:
+    if torch.is_tensor(x):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _codes(x: np.ndarray) -> np.ndarray:
+    """Maps the values of a 1-D array to consecutive integers 0..K-1."""
+    return np.unique(x, return_inverse=True)[1].reshape(-1)
+
+
+def _entropy_bits(codes: np.ndarray) -> float:
+    counts = np.bincount(codes).astype(np.float64)
+    p = counts[counts > 0] / counts.sum()
+    return float(-(p * np.log2(p)).sum())
+
+
+def discrete_mutual_info(x, y) -> float:
+    """I[x; y] in bits for two 1-D arrays of discrete values (plug-in estimate).
+
+    >>> round(discrete_mutual_info([0, 0, 1, 1], [5, 5, 7, 7]), 6)
+    1.0
+    >>> round(discrete_mutual_info([0, 0, 1, 1], [5, 7, 5, 7]), 6)
+    0.0
+    """
+    cx, cy = _codes(_to_numpy(x)), _codes(_to_numpy(y))
+    joint = cx.astype(np.int64) * (int(cy.max()) + 1) + cy
+    return _entropy_bits(cx) + _entropy_bits(cy) - _entropy_bits(_codes(joint))
+
+
+def mutual_info_matrix(attributes, messages) -> np.ndarray:
+    """Matrix of I[attribute_i; symbol at position j] in bits, shape [n_attributes, message length]."""
+    a, m = _to_numpy(attributes), _to_numpy(messages)
+    out = np.zeros((a.shape[1], m.shape[1]))
+    for i in range(a.shape[1]):
+        for j in range(m.shape[1]):
+            out[i, j] = discrete_mutual_info(a[:, i], m[:, j])
+    return out
+
+
+def gap_mi_first_second_fast(attributes, representations) -> float:
+    """Vectorized equivalent of `gap_mi_first_second` (same definition, numpy implementation)."""
+    a, r = _to_numpy(attributes), _to_numpy(representations)
+    mi = mutual_info_matrix(a, r)  # [n_attributes, n_positions]
+    gaps, non_constant = 0.0, 0
+    for j in range(r.shape[1]):
+        h_j = _entropy_bits(_codes(r[:, j]))
+        if h_j > 0.0:
+            top = np.sort(mi[:, j])[::-1]
+            second = top[1] if len(top) > 1 else 0.0
+            gaps += (top[0] - second) / h_j
+            non_constant += 1
+    return float(gaps / non_constant) if non_constant > 0 else float("nan")
+
+
+def compute_posdis(attributes, messages) -> float:
+    """Positional disentanglement (Chaabouni et al., 2020)."""
+    return gap_mi_first_second_fast(attributes, messages)
+
+
+def compute_bosdis(attributes, messages, vocab_size: int) -> float:
+    """Bag-of-symbols disentanglement (Chaabouni et al., 2020); symbol 0 (eos) is ignored,
+    as in `Disent.bosdis`."""
+    m = _to_numpy(messages)
+    histogram = np.stack([(m == v).sum(axis=1) for v in range(1, vocab_size)], axis=1)
+    return gap_mi_first_second_fast(attributes, histogram)
+
+
+def sample_pairs(n_items: int, max_pairs: Optional[int], seed: int = 0) -> np.ndarray:
+    """All pairs i<j of `n_items` items, or a fixed random subset of `max_pairs` of them; [P, 2]."""
+    n_all = n_items * (n_items - 1) // 2
+    if max_pairs is None or max_pairs >= n_all:
+        i, j = np.triu_indices(n_items, k=1)
+        return np.stack([i, j], axis=1)
+    rng = np.random.RandomState(seed)
+    i = rng.randint(0, n_items, size=2 * max_pairs)
+    j = rng.randint(0, n_items, size=2 * max_pairs)
+    keep = i != j
+    return np.stack([i[keep], j[keep]], axis=1)[:max_pairs]
+
+
+def compute_topsim_from_pairs(
+    attributes, messages, pairs: Optional[Sequence] = None
+) -> float:
+    """Topographic similarity: Spearman correlation between the Hamming distance of attribute
+    vectors and the edit distance of messages, over the given pairs (default: all pairs).
+    Returns nan if either distance is constant.
+
+    >>> a = [[0, 0], [0, 1], [1, 0], [1, 1]]
+    >>> round(compute_topsim_from_pairs(a, a), 6)
+    1.0
+    """
+    a, m = _to_numpy(attributes), _to_numpy(messages)
+    if pairs is None:
+        pairs = sample_pairs(len(a), None)
+    pairs = np.asarray(pairs)
+    i, j = pairs[:, 0], pairs[:, 1]
+    d_meaning = (a[i] != a[j]).sum(axis=1)
+    msgs = [tuple(row) for row in m.tolist()]
+    d_message = np.fromiter(
+        (editdistance.eval(msgs[x], msgs[y]) for x, y in zip(i.tolist(), j.tolist())),
+        dtype=np.float64,
+        count=len(i),
+    )
+    if d_meaning.min() == d_meaning.max() or d_message.min() == d_message.max():
+        return float("nan")
+    return float(spearmanr(d_meaning, d_message).correlation)
